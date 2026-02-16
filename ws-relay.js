@@ -7,6 +7,7 @@ import { createClient } from "@supabase/supabase-js";
 const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const FLUSH_DELAY_MS = Number(process.env.FLUSH_DELAY_MS) || 5000;
 
 // Supabase client
 const supabase =
@@ -14,13 +15,94 @@ const supabase =
     ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
     : null;
 
+// ──────────────────────────────────────────────
+// Transcript buffer: accumulates chunks per speaker
+// and flushes to Supabase after a silence gap
+// ──────────────────────────────────────────────
+const buffers = new Map();
+
+function getBufferKey(bot_id, speaker) {
+  return `${bot_id}::${speaker || "unknown"}`;
+}
+
+function flushBuffer(key) {
+  const buf = buffers.get(key);
+  if (!buf || !buf.chunks.length) return;
+
+  const fullText = buf.chunks.join(" ").trim();
+  if (!fullText) {
+    buffers.delete(key);
+    return;
+  }
+
+  console.log(`💾 Flushing [${buf.bot_id}] ${buf.speaker || "Unknown"}: ${fullText.slice(0, 100)}...`);
+
+  if (supabase) {
+    supabase
+      .from("copilot_transcripts")
+      .insert({
+        call_id: buf.bot_id,
+        text: fullText,
+        meta: {
+          speaker: buf.speaker,
+          participant_id: buf.participant_id,
+          start_time: buf.start_time,
+          end_time: buf.end_time,
+          source: "recall_ai",
+          chunk_count: buf.chunks.length,
+        },
+      })
+      .then(({ error }) => {
+        if (error) {
+          console.error("Supabase insert failed:", error.message);
+        } else {
+          console.log(`✅ Inserted complete utterance (${buf.chunks.length} chunks merged)`);
+        }
+      });
+  }
+
+  buffers.delete(key);
+}
+
+function addToBuffer({ bot_id, text, speaker, participant_id, start_time, end_time }) {
+  const key = getBufferKey(bot_id, speaker);
+  let buf = buffers.get(key);
+
+  if (!buf) {
+    buf = {
+      bot_id,
+      speaker,
+      participant_id,
+      start_time,
+      end_time: null,
+      chunks: [],
+      timer: null,
+    };
+    buffers.set(key, buf);
+  }
+
+  buf.chunks.push(text);
+  buf.end_time = end_time;
+
+  // Reset the flush timer on every new chunk
+  if (buf.timer) clearTimeout(buf.timer);
+  buf.timer = setTimeout(() => flushBuffer(key), FLUSH_DELAY_MS);
+}
+
+// ──────────────────────────────────────────────
 // Express app + HTTP server
+// ──────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
-// Health check (Railway uses this to verify the service is up)
+// Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", supabase: !!supabase });
+  res.json({
+    status: "ok",
+    supabase: !!supabase,
+    active_buffers: buffers.size,
+    flush_delay_ms: FLUSH_DELAY_MS,
+  });
 });
 
 // ──────────────────────────────────────────────
@@ -59,32 +141,15 @@ app.post("/webhook", async (req, res) => {
 
   console.log(`➡️ [${bot_id}] ${speaker || "Unknown"}: ${text}${is_partial ? " (partial)" : ""}`);
 
-  // Insert into Supabase (skip partial transcripts to avoid duplicates)
-  if (supabase && !is_partial) {
-    const { error } = await supabase.from("copilot_transcripts").insert({
-      call_id: bot_id,
-      text,
-      meta: {
-        speaker,
-        participant_id,
-        start_time,
-        end_time,
-        source: "recall_ai",
-        event,
-      },
-    });
-
-    if (error) {
-      console.error("Supabase insert failed:", error.message);
-      return res.status(500).json({ error: "Database insert failed" });
-    }
-
-    console.log("✅ Inserted into Supabase");
+  // Buffer final transcripts — flush to Supabase after silence gap
+  // Partials are only sent to WebSocket for real-time display
+  if (!is_partial && supabase) {
+    addToBuffer({ bot_id, text, speaker, participant_id, start_time, end_time });
   } else if (!supabase) {
     console.log("ℹ️ Supabase not configured — skipping insert");
   }
 
-  // Broadcast to all connected WebSocket clients (real-time to frontend)
+  // Broadcast to all connected WebSocket clients immediately (real-time to frontend)
   const wsMessage = JSON.stringify({
     call_id: bot_id,
     text,
@@ -156,6 +221,20 @@ wss.on("connection", (ws) => {
   });
 });
 
+// ──────────────────────────────────────────────
+// Graceful shutdown: flush all pending buffers
+// ──────────────────────────────────────────────
+function gracefulShutdown() {
+  console.log("🛑 Shutting down — flushing all pending buffers...");
+  for (const [key] of buffers) {
+    flushBuffer(key);
+  }
+  setTimeout(() => process.exit(0), 2000);
+}
+
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown);
+
 // Start server
 server.listen(PORT, () => {
   console.log(`✅ Relay server running on port ${PORT}`);
@@ -163,4 +242,5 @@ server.listen(PORT, () => {
   console.log(`   WebSocket:    ws://localhost:${PORT}`);
   console.log(`   Health check: http://localhost:${PORT}/health`);
   console.log(`   Supabase:     ${supabase ? "connected" : "not configured"}`);
+  console.log(`   Buffer flush: ${FLUSH_DELAY_MS}ms silence gap`);
 });
